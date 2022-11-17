@@ -4,12 +4,13 @@ import json
 import logging
 from pathlib import Path
 import random
-
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import transformers
+from sklearn.metrics import accuracy_score
 from transformers import AutoConfig, AutoModelWithLMHead, AutoTokenizer
 from tqdm import tqdm
 
@@ -51,7 +52,7 @@ class PredictWrapper:
         model_inputs = replace_trigger_tokens(model_inputs, trigger_ids, trigger_mask)
         logits, *_ = self._model(**model_inputs)
         predict_logits = logits.masked_select(predict_mask.unsqueeze(-1)).view(logits.size(0), -1)
-        return predict_logits
+        return predict_logits, model_inputs
 
 
 class AccuracyFn:
@@ -68,6 +69,7 @@ class AccuracyFn:
         for label, label_tokens in label_map.items():
             self._all_label_ids.append(utils.encode_label(tokenizer, label_tokens, tokenize_labels).to(device))
             self._pred_to_label.append(label)
+        print("Label Map", label_map)
         logger.info(self._all_label_ids)
 
     def __call__(self, predict_logits, gold_label_ids):
@@ -82,13 +84,13 @@ class AccuracyFn:
             all_label_logp.append(label_logp)
         all_label_logp = torch.stack(all_label_logp, dim=-1)
         _, predictions = all_label_logp.max(dim=-1)
-        predictions = [self._pred_to_label[x] for x in predictions.tolist()]
+        predicted_labels = [self._pred_to_label[x] for x in predictions.tolist()]
 
         # Add up the number of entries where loss is greater than or equal to gold_logp.
         ge_count = all_label_logp.le(gold_logp.unsqueeze(-1)).sum(-1)
         correct = ge_count.le(1)  # less than in case of num. prec. issues
 
-        return correct.float()
+        return correct.float(), predicted_labels, predictions
 
     # TODO: @rloganiv - This is hacky. Replace with something sensible.
     def predict(self, predict_logits):
@@ -113,6 +115,7 @@ def load_pretrained(model_name):
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name, add_prefix_space=True)
     utils.add_task_specific_tokens(tokenizer)
+    print("Created Pretrained Model")
     return config, model, tokenizer
 
 
@@ -205,6 +208,10 @@ def run_model(args):
 
     if args.label_map is not None:
         label_map = json.loads(args.label_map)
+        print("This is the Label Map", label_map)
+        reverse_label_map = {' '.join(y): x for x, y in label_map.items()}
+        #reverse_label_map = {v:k for k,v in label_map.items()}
+        print("Reverse Label Map", reverse_label_map)
         logger.info(f"Label map: {label_map}")
     else:
         label_map = None
@@ -282,12 +289,24 @@ def run_model(args):
     logger.info('Evaluating')
     numerator = 0
     denominator = 0
-    for model_inputs, labels in tqdm(dev_loader):
+    file_count = 0
+    
+    for i, (model_inputs, labels) in enumerate(tqdm(dev_loader)):
         model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+
         labels = labels.to(device)
         with torch.no_grad():
-            predict_logits = predictor(model_inputs, trigger_ids)
-        numerator += evaluation_fn(predict_logits, labels).sum().item()
+            predict_logits, trigger_inputs = predictor(model_inputs, trigger_ids)
+
+        correct, pred_labels, predictions = evaluation_fn(predict_logits, labels)
+
+        #decoded_preds = tokenizer.convert_ids_to_tokens(predictions)
+        #print("Predict Logits", predict_logits)
+        
+
+
+
+        numerator += correct.sum().item()
         denominator += labels.size(0)
     dev_metric = numerator / (denominator + 1e-13)
     logger.info(f'Dev metric: {dev_metric}')
@@ -321,7 +340,7 @@ def run_model(args):
                 break
             model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
             labels = labels.to(device)
-            predict_logits = predictor(model_inputs, trigger_ids)
+            predict_logits, trigger_inputs = predictor(model_inputs, trigger_ids)
             loss = get_loss(predict_logits, labels).mean()
             loss.backward()
 
@@ -363,8 +382,8 @@ def run_model(args):
             model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
             labels = labels.to(device)
             with torch.no_grad():
-                predict_logits = predictor(model_inputs, trigger_ids)
-                eval_metric = evaluation_fn(predict_logits, labels)
+                predict_logits, trigger_inputs = predictor(model_inputs, trigger_ids)
+                eval_metric, pred_labels, predictions = evaluation_fn(predict_logits, labels)
 
             # Update current score
             current_score += eval_metric.sum()
@@ -381,8 +400,8 @@ def run_model(args):
                 temp_trigger = trigger_ids.clone()
                 temp_trigger[:, token_to_flip] = candidate
                 with torch.no_grad():
-                    predict_logits = predictor(model_inputs, temp_trigger)
-                    eval_metric = evaluation_fn(predict_logits, labels)
+                    predict_logits, trigger_inputs = predictor(model_inputs, temp_trigger)
+                    eval_metric, pred_labels, predictions = evaluation_fn(predict_logits, labels)
 
                 candidate_scores[i] += eval_metric.sum()
 
@@ -400,19 +419,62 @@ def run_model(args):
             trigger_ids[:, token_to_flip] = candidates[best_candidate_idx]
             logger.info(f'Train metric: {best_candidate_score / (denom + 1e-13): 0.4f}')
         else:
-            logger.info('No improvement detected. Skipping evaluation.')
-            continue
+            logger.info('No improvement detected.')
+            #continue
 
         logger.info('Evaluating')
         numerator = 0
         denominator = 0
-        for model_inputs, labels in tqdm(dev_loader):
+        
+        random_select = np.random.randint(low=0, high=len(dev_loader))
+        for i, (model_inputs, labels) in enumerate(tqdm(dev_loader)):
             model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
             labels = labels.to(device)
             with torch.no_grad():
-                predict_logits = predictor(model_inputs, trigger_ids)
-            numerator += evaluation_fn(predict_logits, labels).sum().item()
+                predict_logits, trigger_inputs = predictor(model_inputs, trigger_ids)
+            eval_metric, pred_labels, predictions = evaluation_fn(predict_logits, labels)
+            numerator += eval_metric.sum().item()
             denominator += labels.size(0)
+
+            if i == random_select:  
+                sentences = []
+                for sentence in model_inputs['input_ids']:
+                    sentences.append(tokenizer.convert_ids_to_tokens(sentence))
+                rand_index = np.random.randint(low=0, high=len(sentences))
+
+                print("Input sentence example", ' '.join([s for s in sentences[rand_index] if s != '<pad>']))
+
+                prompts = []
+                for prompt in trigger_inputs['input_ids']:
+                    prompts.append(tokenizer.convert_ids_to_tokens(prompt))
+                print("Corresponding Prompt example", ' '.join([s for s in prompts[rand_index] if s != '<pad>']))
+                
+                #print("Predicted Labels", pred_labels)
+            
+                label_lists = []
+                for label_tensor in labels:
+                    label_lists.append(tokenizer.convert_ids_to_tokens(label_tensor))
+                decoded_labels = []
+                for l in label_lists:
+                    decoded_labels.append(reverse_label_map[' '.join(l)])
+
+                #print("Decoded Labels", decoded_labels)
+
+                decoded_labels = np.array(decoded_labels)
+                pred_labels = np.array(pred_labels)
+                
+                print("Batch Accuracy", accuracy_score(decoded_labels, pred_labels))
+                z = np.where(decoded_labels != pred_labels)
+
+                filtered_prompts = np.array(prompts)[z]
+                #print("Error Analysis", filtered_prompts, decoded_labels[z], pred_labels[z])
+                error_prompts = [' '.join([u for u in p if u != '<pad>']) for p in filtered_prompts]
+                actual_inputs = [' '.join([t for t in s if t != '<pad>']) for s in np.array(sentences)[z]]
+                zipped = list(zip(actual_inputs, error_prompts, decoded_labels[z], pred_labels[z]))
+                df = pd.DataFrame(zipped, columns=['Inputs', 'Prompts', 'True Label', 'Predicted Label'])
+                df.to_csv('error_analysis_single_batch'+str(file_count)+'.csv', index=False)
+                file_count += 1
+
         dev_metric = numerator / (denominator + 1e-13)
 
         logger.info(f'Trigger tokens: {tokenizer.convert_ids_to_tokens(trigger_ids.squeeze(0))}')
